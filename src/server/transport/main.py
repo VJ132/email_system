@@ -11,7 +11,7 @@ keys_dir = os.path.dirname(os.path.dirname(__file__)) + "/keys/"
 STREAM_END = b"\x00" * 3
 client_key_journal = {}
 
-async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes] | None:
+async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes] | None:
     mlkem_private_key, mlkem_public_key, x25519_private_key, x25519_public_key, mldsa_private_key, mldsa_public_key, _ = crypto_helpers.fetch_self_keys(keys_dir + "self/")
     if await reader.readexactly(1) == b"\x01":
         writer.write(mldsa_public_key.public_bytes_raw())
@@ -87,17 +87,22 @@ async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio
         await writer.wait_closed()
         return
 
-    rec_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, client_salt, b"CLIENT KEY")
-    sen_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, salt, b"SERVER KEY")
-    rec_counter_hkdf_ctx = HKDF(hashes.SHA3_512(), 64, salt + client_salt, b"SERVER AAD COUNTER")
-    sen_counter_hkdf_ctx = HKDF(hashes.SHA3_512(), 64, client_salt + salt, b"CLIENT AAD COUNTER")
+    rec_aes_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, client_salt, b"CLIENT KEY")
+    sen_aes_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, salt, b"SERVER KEY")
+    rec_hmac_hkdf_ctx = HKDF(hashes.SHA3_512(), 32, client_salt + salt, b"CLIENT HMAC KEY")
+    sen_hmac_hkdf_ctx = HKDF(hashes.SHA3_512(), 32, salt + client_salt, b"SERVER HMAC KEY")
+    rec_counter_hkdf_ctx = HKDF(hashes.SHA3_512(), 64, client_salt + salt, b"CLIENT AAD COUNTER")
+    sen_counter_hkdf_ctx = HKDF(hashes.SHA3_512(), 64, salt + client_salt, b"SERVER AAD COUNTER")
 
-    sending_key = sen_hkdf_ctx.derive(mlkem_secret + x25519_shared_secret)
-    receiving_key = rec_hkdf_ctx.derive(client_mlkem_secret + x25519_shared_secret)
-    sending_counter = rec_counter_hkdf_ctx.derive(sending_key)
-    receiving_counter = sen_counter_hkdf_ctx.derive(receiving_key)
+    sending_aes_key = sen_aes_hkdf_ctx.derive(mlkem_secret + x25519_shared_secret)
+    receiving_aes_key = rec_aes_hkdf_ctx.derive(client_mlkem_secret + x25519_shared_secret)
+    sending_hmac_key = sen_hmac_hkdf_ctx.derive(mlkem_secret + x25519_shared_secret)
+    receiving_hmac_key = rec_hmac_hkdf_ctx.derive(client_mlkem_secret + x25519_shared_secret)
+    sending_counter = sen_counter_hkdf_ctx.derive(sending_aes_key)
+    receiving_counter = rec_counter_hkdf_ctx.derive(receiving_aes_key)
 
-    return sending_key, receiving_key, sending_counter, receiving_counter
+    return sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter
+
 
 async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
     print(f"LOG: Connection from {writer.get_extra_info("peername")}")
@@ -105,22 +110,20 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
     if keys == None:
         return
 
-    sending_key, receiving_key, sending_counter, receiving_counter = keys
-    print(f"Sending Key: {sending_key.hex().upper()}\nReceiving Key: {receiving_key.hex().upper()}")
+    sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter = keys
+    print(f"Sending Key: {sending_aes_key.hex().upper()}\nReceiving Key: {receiving_aes_key.hex().upper()}")
     while True:
         payload = b""
         while True:
             header = await reader.readexactly(3)
             signature = await reader.readexactly(32)
-            crypto_helpers.verify_hmac_signature(receiving_key, header, signature)
+            receiving_counter = (int.from_bytes(receiving_counter, "big") + 1).to_bytes(64, "big")
+            crypto_helpers.verify_hmac_signature(receiving_hmac_key, header + receiving_counter, signature)
             if header == STREAM_END:
                 break
 
-            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header[:3], "big"))
-            payload += crypto_helpers.decrypt_payload(receiving_key, encrypted_frame, receiving_counter)
-
-            receiving_counter = (int.from_bytes(receiving_counter, "big") + 1).to_bytes(64, "big")
-
+            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header, "big"))
+            payload += crypto_helpers.decrypt_payload(receiving_aes_key, encrypted_frame, receiving_counter)
 
 async def start_serving():
     server_ctx = await asyncio.start_server(handle_connection, "localhost", 6969, family = socket.AF_INET6)

@@ -10,40 +10,41 @@ keys_dir = os.path.dirname(os.path.dirname(__file__)) + "/keys/"
 MAX_DATA_BYTES_PER_FRAME = 0xffffff - 16
 STREAM_END = b"\x00" * 3
 
-async def read(reader: asyncio.StreamReader, key: bytes, counter: bytes):
+async def read(reader: asyncio.StreamReader, aes_key: bytes, hmac_key: bytes, counter: bytes):
     while True:
         payload = b""
         while True:
             header = await reader.readexactly(3)
             signature = await reader.readexactly(32)
-            crypto_helpers.verify_hmac_signature(key, header, signature)
+            counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
+            crypto_helpers.verify_hmac_signature(hmac_key, header + counter, signature)
             if header == STREAM_END:
                 break
 
-            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header[:3], "big"))
-            payload += crypto_helpers.decrypt_payload(key, encrypted_frame, counter)
+            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header, "big"))
+            payload += crypto_helpers.decrypt_payload(aes_key, encrypted_frame, counter)
 
-            counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
 
         print(payload)
 
-async def write(writer: asyncio.StreamWriter, key: bytes, counter: bytes, data: bytes):
+async def write(writer: asyncio.StreamWriter, aes_key: bytes, hmac_key: bytes, counter: bytes, data: bytes):
     for i in range(0, len(data), MAX_DATA_BYTES_PER_FRAME):
-        encrypted_frame = crypto_helpers.encrypt_payload(key, data[i:i + MAX_DATA_BYTES_PER_FRAME], counter)
+        counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
+        encrypted_frame = crypto_helpers.encrypt_payload(aes_key, data[i:i + MAX_DATA_BYTES_PER_FRAME], counter)
 
         header = (len(encrypted_frame) - 12).to_bytes(3, "big")
         writer.write(header)
-        writer.write(crypto_helpers.generate_hmac_signature(key, header))
+        writer.write(crypto_helpers.generate_hmac_signature(hmac_key, header + counter))
         writer.write(encrypted_frame)
         await writer.drain()
 
-        counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
 
+    counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
     writer.write(STREAM_END)
-    writer.write(crypto_helpers.generate_hmac_signature(key, STREAM_END))
+    writer.write(crypto_helpers.generate_hmac_signature(hmac_key, STREAM_END + counter))
     await writer.drain()
 
-async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes]:
+async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes]:
     mlkem_private_key, mlkem_public_key, x25519_private_key, x25519_public_key, mldsa_private_key, mldsa_public_key, identity_token = crypto_helpers.fetch_self_keys(keys_dir + "self/")
 
     # Check if the client has the server's MLDSA public key.
@@ -114,24 +115,28 @@ async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio
     writer.write(payload + mldsa_private_key.sign(payload, b"CLIENT HANDSHAKE VALUES"))
     await writer.drain()
 
-    rec_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, server_salt, b"SERVER KEY")
-    sen_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, salt, b"CLIENT KEY")
+    rec_aes_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, server_salt, b"SERVER KEY")
+    sen_aes_hkdf_ctx = HKDF(hashes.SHA3_256(), 32, salt, b"CLIENT KEY")
+    rec_hmac_hkdf_ctx = HKDF(hashes.SHA3_512(), 32, server_salt + salt, b"SERVER HMAC KEY")
+    sen_hmac_hkdf_ctx = HKDF(hashes.SHA3_512(), 32, salt + server_salt, b"CLIENT HMAC KEY")
     rec_counter_hkdf_ctx = HKDF(hashes.SHA3_512(), 64, server_salt + salt, b"SERVER AAD COUNTER")
     sen_counter_hkdf_ctx = HKDF(hashes.SHA3_512(), 64, salt + server_salt, b"CLIENT AAD COUNTER")
 
-    sending_key = sen_hkdf_ctx.derive(mlkem_secret + x25519_shared_secret)
-    receiving_key = rec_hkdf_ctx.derive(server_mlkem_secret + x25519_shared_secret)
-    sending_counter = sen_counter_hkdf_ctx.derive(sending_key)
-    receiving_counter = rec_counter_hkdf_ctx.derive(receiving_key)
+    sending_aes_key = sen_aes_hkdf_ctx.derive(mlkem_secret + x25519_shared_secret)
+    receiving_aes_key = rec_aes_hkdf_ctx.derive(server_mlkem_secret + x25519_shared_secret)
+    sending_hmac_key = sen_hmac_hkdf_ctx.derive(mlkem_secret + x25519_shared_secret)
+    receiving_hmac_key = rec_hmac_hkdf_ctx.derive(server_mlkem_secret + x25519_shared_secret)
+    sending_counter = sen_counter_hkdf_ctx.derive(sending_aes_key)
+    receiving_counter = rec_counter_hkdf_ctx.derive(receiving_aes_key)
 
-    return sending_key, receiving_key, sending_counter, receiving_counter
+    return sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter
 
 async def connect():
     r, w = await asyncio.open_connection("localhost", 6969, family = socket.AF_INET6)
-    sending_key, receiving_key, sending_counter, receiving_counter = await establish_symmetric_keys(r, w)
-    print(f"Sending Key: {sending_key.hex().upper()}\nReceiving Key: {receiving_key.hex().upper()}")
-    await write(w, sending_key, sending_counter, b"A" * (MAX_DATA_BYTES_PER_FRAME + 1))
-    await read(r, receiving_key, receiving_counter)
+    sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter = await establish_symmetric_keys(r, w)
+    print(f"Sending Key: {sending_aes_key.hex().upper()}\nReceiving Key: {receiving_aes_key.hex().upper()}")
+    await write(w, sending_aes_key, sending_hmac_key, sending_counter, b"A" * (MAX_DATA_BYTES_PER_FRAME + 1))
+    await read(r, receiving_aes_key, sending_hmac_key, receiving_counter)
 
 def main():
     asyncio.run(connect())
