@@ -136,7 +136,7 @@ async def connect():
     sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter = await establish_symmetric_keys(r, w)
     print(f"Sending Key: {sending_aes_key.hex().upper()}\nReceiving Key: {receiving_aes_key.hex().upper()}")
     await write(w, sending_aes_key, sending_hmac_key, sending_counter, b"A" * (MAX_DATA_BYTES_PER_FRAME + 1))
-    await read(r, receiving_aes_key, sending_hmac_key, receiving_counter)
+    await read(r, receiving_aes_key, receiving_hmac_key, receiving_counter)
 
 def main():
     asyncio.run(connect())
