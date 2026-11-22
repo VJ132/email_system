@@ -6,34 +6,44 @@ import socket
 import sys
 import os
 
+keys_dir = os.path.dirname(os.path.dirname(__file__)) + "/keys/"
 MAX_DATA_BYTES_PER_FRAME = 0xffffff - 16
+STREAM_END = b"\x00" * 3
 
 async def read(reader: asyncio.StreamReader, key: bytes, counter: bytes):
     while True:
         payload = b""
         while True:
             header = await reader.readexactly(3)
-            if header == b"\x00" * 3:
+            signature = await reader.readexactly(32)
+            crypto_helpers.verify_hmac_signature(key, header, signature)
+            if header == STREAM_END:
                 break
-            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header, "big"))
+
+            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header[:3], "big"))
             payload += crypto_helpers.decrypt_payload(key, encrypted_frame, counter)
 
             counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
+
         print(payload)
-        payload = b""
 
 async def write(writer: asyncio.StreamWriter, key: bytes, counter: bytes, data: bytes):
     for i in range(0, len(data), MAX_DATA_BYTES_PER_FRAME):
         encrypted_frame = crypto_helpers.encrypt_payload(key, data[i:i + MAX_DATA_BYTES_PER_FRAME], counter)
 
-        writer.write((len(encrypted_frame) - 12).to_bytes(3, "big") + encrypted_frame)
+        header = (len(encrypted_frame) - 12).to_bytes(3, "big")
+        writer.write(header)
+        writer.write(crypto_helpers.generate_hmac_signature(key, header))
+        writer.write(encrypted_frame)
         await writer.drain()
+
         counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
-    writer.write(b"\x00" * 3)
+
+    writer.write(STREAM_END)
+    writer.write(crypto_helpers.generate_hmac_signature(key, STREAM_END))
     await writer.drain()
 
 async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes]:
-    keys_dir = "/home/berzerk/Desktop/Projects/Python_Projects/Transport/src/client/keys/"
     mlkem_private_key, mlkem_public_key, x25519_private_key, x25519_public_key, mldsa_private_key, mldsa_public_key, identity_token = crypto_helpers.fetch_self_keys(keys_dir + "self/")
 
     # Check if the client has the server's MLDSA public key.
@@ -118,9 +128,8 @@ async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio
 
 async def connect():
     r, w = await asyncio.open_connection("localhost", 6969, family = socket.AF_INET6)
-    global aad_counter
     sending_key, receiving_key, sending_counter, receiving_counter = await establish_symmetric_keys(r, w)
-    print(f"LOG: Keys Established Successfully! Sending Key: {sending_key.hex()}, Receiving Key: {receiving_key.hex()}.")
+    print(f"Sending Key: {sending_key.hex().upper()}\nReceiving Key: {receiving_key.hex().upper()}")
     await write(w, sending_key, sending_counter, b"A" * (MAX_DATA_BYTES_PER_FRAME + 1))
     await read(r, receiving_key, receiving_counter)
 

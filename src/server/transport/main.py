@@ -7,8 +7,8 @@ import socket
 import sys
 import os
 
-keys_dir = "/home/berzerk/Desktop/Projects/Python_Projects/Transport/src/server/keys/"
-
+keys_dir = os.path.dirname(os.path.dirname(__file__)) + "/keys/"
+STREAM_END = b"\x00" * 3
 client_key_journal = {}
 
 async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes] | None:
@@ -41,7 +41,8 @@ async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio
         sha3_512_ctx.update(os.urandom(64))
         client_identity_token = sha3_512_ctx.finalize()
 
-        writer.write(client_identity_token + mldsa_private_key.sign(client_identity_token, b"SERVER ASSIGNED IDENTITY TOKEN"))
+        writer.write(client_identity_token)
+        writer.write(mldsa_private_key.sign(client_identity_token, b"SERVER ASSIGNED IDENTITY TOKEN"))
         await writer.drain()
 
         client_mldsa_public_key = crypto_helpers.mldsa.MLDSA65PublicKey.from_public_bytes(client_mldsa_public_bytes)
@@ -70,7 +71,8 @@ async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio
 
     payload = mlkem_ciphertext + x25519_public_key.public_bytes_raw() + salt
 
-    writer.write(payload + mldsa_private_key.sign(payload, b"SERVER HANDSHAKE VALUES"))
+    writer.write(payload)
+    writer.write(mldsa_private_key.sign(payload, b"SERVER HANDSHAKE VALUES"))
     await writer.drain()
 
     payload = await reader.readexactly(1088 + 32 + 16 + 3309)
@@ -104,19 +106,21 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
         return
 
     sending_key, receiving_key, sending_counter, receiving_counter = keys
-    print(f"LOG: Keys Established Successfully! Sending Key: {sending_key.hex()}, Receiving Key: {receiving_key.hex()}.")
+    print(f"Sending Key: {sending_key.hex().upper()}\nReceiving Key: {receiving_key.hex().upper()}")
     while True:
         payload = b""
         while True:
             header = await reader.readexactly(3)
-            if header == b"\x00" * 3:
+            signature = await reader.readexactly(32)
+            crypto_helpers.verify_hmac_signature(receiving_key, header, signature)
+            if header == STREAM_END:
                 break
-            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header, "big"))
 
+            encrypted_frame = await reader.readexactly(12 + int.from_bytes(header[:3], "big"))
             payload += crypto_helpers.decrypt_payload(receiving_key, encrypted_frame, receiving_counter)
+
             receiving_counter = (int.from_bytes(receiving_counter, "big") + 1).to_bytes(64, "big")
 
-        payload = b""
 
 async def start_serving():
     server_ctx = await asyncio.start_server(handle_connection, "localhost", 6969, family = socket.AF_INET6)

@@ -1,7 +1,9 @@
 from cryptography.hazmat.primitives.asymmetric import mlkem, mldsa, x25519
 from cryptography.hazmat.primitives.ciphers import aead
+import cryptography.exceptions as crypto_exceptions
 from cryptography.hazmat.primitives.kdf import hkdf
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hmac
 import os
 
 def encrypt_payload(key: bytes, payload: bytes, aad: bytes) -> bytes:
@@ -49,3 +51,13 @@ def fetch_self_keys(keys_dir: str) -> tuple[mlkem.MLKEM768PrivateKey, mlkem.MLKE
     identity_token = read_bytes(64, keys_dir + "identity_token.key")
 
     return mlkem_private_key, mlkem_public_key, x25519_private_key, x25519_public_key, mldsa_private_key, mldsa_public_key, identity_token
+
+def generate_hmac_signature(key: bytes, data: bytes) -> bytes:
+    hmac_ctx = hmac.HMAC(key, hashes.SHA3_256())
+    hmac_ctx.update(data)
+    return hmac_ctx.finalize()
+
+def verify_hmac_signature(key: bytes, data: bytes, sig: bytes):
+    hmac_ctx = hmac.HMAC(key, hashes.SHA3_256())
+    hmac_ctx.update(data)
+    hmac_ctx.verify(sig)
