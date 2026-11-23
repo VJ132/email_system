@@ -13,6 +13,7 @@ STREAM_END = b"\x00" * 3
 async def read(reader: asyncio.StreamReader, aes_key: bytes, hmac_key: bytes, counter: bytes):
     while True:
         payload = b""
+        frame_count = 0
         while True:
             header = await reader.readexactly(3)
             signature = await reader.readexactly(32)
@@ -23,11 +24,12 @@ async def read(reader: asyncio.StreamReader, aes_key: bytes, hmac_key: bytes, co
 
             encrypted_frame = await reader.readexactly(12 + int.from_bytes(header, "big"))
             payload += crypto_helpers.decrypt_payload(aes_key, encrypted_frame, counter)
+            frame_count += 1
 
-
-        print(payload)
+        print(f"Frames Received: {frame_count}\nPayload Length: {len(payload)}")
 
 async def write(writer: asyncio.StreamWriter, aes_key: bytes, hmac_key: bytes, counter: bytes, data: bytes):
+    frame_count = 0
     for i in range(0, len(data), MAX_DATA_BYTES_PER_FRAME):
         counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
         encrypted_frame = crypto_helpers.encrypt_payload(aes_key, data[i:i + MAX_DATA_BYTES_PER_FRAME], counter)
@@ -37,12 +39,15 @@ async def write(writer: asyncio.StreamWriter, aes_key: bytes, hmac_key: bytes, c
         writer.write(crypto_helpers.generate_hmac_signature(hmac_key, header + counter))
         writer.write(encrypted_frame)
         await writer.drain()
+        frame_count += 1
 
 
     counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
     writer.write(STREAM_END)
     writer.write(crypto_helpers.generate_hmac_signature(hmac_key, STREAM_END + counter))
     await writer.drain()
+
+    print(f"Frames Sent: {frame_count}\nPayload Length: {len(data)}")
 
 async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> tuple[bytes, bytes, bytes, bytes, bytes, bytes]:
     mlkem_private_key, mlkem_public_key, x25519_private_key, x25519_public_key, mldsa_private_key, mldsa_public_key, identity_token = crypto_helpers.fetch_self_keys(keys_dir + "self/")
@@ -134,7 +139,6 @@ async def establish_symmetric_keys(reader: asyncio.StreamReader, writer: asyncio
 async def connect():
     r, w = await asyncio.open_connection("localhost", 6969, family = socket.AF_INET6)
     sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter = await establish_symmetric_keys(r, w)
-    print(f"Sending Key: {sending_aes_key.hex().upper()}\nReceiving Key: {receiving_aes_key.hex().upper()}")
     await write(w, sending_aes_key, sending_hmac_key, sending_counter, b"A" * (MAX_DATA_BYTES_PER_FRAME + 1))
     await read(r, receiving_aes_key, receiving_hmac_key, receiving_counter)
 

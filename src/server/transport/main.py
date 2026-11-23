@@ -8,6 +8,7 @@ import sys
 import os
 
 keys_dir = os.path.dirname(os.path.dirname(__file__)) + "/keys/"
+MAX_DATA_BYTES_PER_FRAME = 0xffffff - 16
 STREAM_END = b"\x00" * 3
 client_key_journal = {}
 
@@ -111,9 +112,9 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
         return
 
     sending_aes_key, receiving_aes_key, sending_hmac_key, receiving_hmac_key, sending_counter, receiving_counter = keys
-    print(f"Sending Key: {sending_aes_key.hex().upper()}\nReceiving Key: {receiving_aes_key.hex().upper()}")
     while True:
         payload = b""
+        frame_count = 0
         while True:
             header = await reader.readexactly(3)
             signature = await reader.readexactly(32)
@@ -124,6 +125,30 @@ async def handle_connection(reader: asyncio.StreamReader, writer: asyncio.Stream
 
             encrypted_frame = await reader.readexactly(12 + int.from_bytes(header, "big"))
             payload += crypto_helpers.decrypt_payload(receiving_aes_key, encrypted_frame, receiving_counter)
+
+            frame_count += 1
+
+        print(f"Frames Received: {frame_count}\nPayload Length: {len(payload)}")
+
+        frame_count = 0
+        data = b"A" * (MAX_DATA_BYTES_PER_FRAME + 1)
+        for i in range(0, len(data), MAX_DATA_BYTES_PER_FRAME):
+            sending_counter = (int.from_bytes(sending_counter, "big") + 1).to_bytes(64, "big")
+            encrypted_frame = crypto_helpers.encrypt_payload(sending_aes_key, data[i:i + MAX_DATA_BYTES_PER_FRAME], sending_counter)
+
+            header = (len(encrypted_frame) - 12).to_bytes(3, "big")
+            writer.write(header)
+            writer.write(crypto_helpers.generate_hmac_signature(sending_hmac_key, header + sending_counter))
+            writer.write(encrypted_frame)
+            await writer.drain()
+            frame_count += 1
+
+        sending_counter = (int.from_bytes(sending_counter, "big") + 1).to_bytes(64, "big")
+        writer.write(STREAM_END)
+        writer.write(crypto_helpers.generate_hmac_signature(sending_hmac_key, STREAM_END + sending_counter))
+        await writer.drain()
+
+        print(f"Frames Sent: {frame_count}\nPayload Length: {len(data)}")
 
 async def start_serving():
     server_ctx = await asyncio.start_server(handle_connection, "localhost", 6969, family = socket.AF_INET6)
