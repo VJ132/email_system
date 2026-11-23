@@ -1,177 +1,217 @@
 # Cryptographic Handshake
 
-## Purpose
+## 1. Overview
 
-The handshake establishes authenticated peer identities and derives independent symmetric traffic material for the two directions of a TCP connection. It combines ML-KEM-768, X25519 and ML-DSA-65, with HKDF-SHA3 used for key derivation.
+The handshake combines two independent ML-KEM-768 exchanges with one ephemeral X25519 exchange. Persistent ML-DSA-65 identity keys authenticate individual handshake messages. The two ML-KEM shared secrets are assigned to opposite traffic directions; the X25519 shared secret contributes to both directions.
 
-## Algorithms and sizes
+The handshake derives six values at each endpoint:
+
+1. Sending AES-256-GCM key.
+2. Receiving AES-256-GCM key.
+3. Sending HMAC-SHA3-256 key.
+4. Receiving HMAC-SHA3-256 key.
+5. Sending initial 64-byte counter.
+6. Receiving initial 64-byte counter.
+
+## 2. Primitive sizes
 
 | Value | Size |
 |---|---:|
-| ML-DSA-65 public key | 1,952 bytes |
-| ML-DSA-65 signature | 3,309 bytes |
 | ML-KEM-768 public key | 1,184 bytes |
 | ML-KEM-768 ciphertext | 1,088 bytes |
 | ML-KEM shared secret | 32 bytes |
 | X25519 public key | 32 bytes |
 | X25519 shared secret | 32 bytes |
+| ML-DSA-65 public key | 1,952 bytes |
+| ML-DSA-65 signature | 3,309 bytes |
+| ML-DSA private seed used by the helper | 32 bytes |
 | Per-peer salt | 16 bytes |
 | Client identity token | 64 bytes |
 
-## Long-term identities
+## 3. Persistent and ephemeral identities
 
-Each peer has a persistent ML-DSA-65 identity key pair. The public key is used to verify signatures on identity and handshake messages.
+### Persistent ML-DSA identities
 
-### Server identity enrollment
+Each endpoint loads its ML-DSA-65 private seed from its local key directory or generates a new keypair when the helper treats the seed as unavailable. The corresponding public key is used to authenticate handshake messages.
 
-1. The client checks whether it has a locally stored server ML-DSA-65 public key.
-2. The client sends a one-byte status: `0x00` when the key is already stored, or `0x01` when it needs the server's public key.
-3. When requested, the server sends its 1,952-byte ML-DSA-65 public key.
-4. The client constructs the public-key object and stores the key for later connections.
+The client stores the server's ML-DSA public key in `keys/server/mldsa_public.key`. The server stores registered client public keys in token-named directories beneath `keys/clients/` and caches resolved keys in `client_key_journal`.
 
-This is a trust-on-first-use (TOFU) model: the first server key received is the key pinned by the client for later connections.
+### Ephemeral key agreement
 
-### Client identity enrollment and lookup
+Each call to `fetch_self_keys()` generates a fresh ML-KEM-768 keypair and a fresh X25519 keypair. These keypairs are used for the current handshake, not loaded as persistent identities.
 
-The client sends a one-byte status:
+## 4. Server identity bootstrap and client registration
 
-- `0x01`: the client has an identity token and sends the 64-byte token.
-- `0x00`: the client has no token and sends its 1,952-byte ML-DSA-65 public key.
+### Server public-key bootstrap
 
-For a new client identity, the server creates a 64-byte token using:
+The client sends one status byte:
+
+- `0x00`: the client has a local server public-key pin.
+- `0x01`: the client does not have a local server public-key pin.
+
+When the server receives `0x01`, it sends its 1,952-byte ML-DSA-65 public key. The client stores the received public key for subsequent connections. This is Trust On First Use (TOFU); the initial key is not independently authenticated by this exchange.
+
+### Client identity registration
+
+If the client already has an identity token, it sends `0x01 || identity_token` (65 bytes total). The server uses the token to find the registered client public key.
+
+If the client has no token, it sends `0x00 || client_MLDSA_public_key` (1,953 bytes total). The server computes:
 
 ```text
-identity_token = SHA3-512(client_mldsa_public_key_bytes || random_64_bytes)
+identity_token = SHA3-512(client_MLDSA_public_key || random_64_bytes)
 ```
 
-The server returns the token followed by an ML-DSA-65 signature over the token, using the context string:
+The server returns:
+
+```text
+identity_token (64 bytes) || ML-DSA-65 signature (3,309 bytes)
+```
+
+The signature context is:
 
 ```text
 SERVER ASSIGNED IDENTITY TOKEN
 ```
 
-The server stores the client's ML-DSA public key under the identity token. On subsequent connections, the token allows the server to retrieve the corresponding public key. The client's later handshake signatures prove possession of the private key associated with that registered public key.
+The client verifies the signature with its server public-key pin and stores the token.
 
-## ML-KEM public-key exchange
+## 5. Handshake message sequence
 
-The peers exchange their ephemeral ML-KEM-768 public keys before encapsulation.
+### Message 1 — Client ML-KEM public key
 
-1. The client sends its 1,184-byte ML-KEM-768 public key and an ML-DSA-65 signature over that public key. The signature context is `CLIENT MLKEM768PublicKey`.
-2. The server verifies the signature using the client's registered ML-DSA public key.
-3. The server sends its 1,184-byte ML-KEM-768 public key and an ML-DSA-65 signature over that public key. The signature context is `SERVER MLKEM768PublicKey`.
-4. The client verifies the signature using the pinned server ML-DSA public key.
-
-## Two ML-KEM encapsulations and X25519
-
-Each peer encapsulates to the other peer's ML-KEM public key. This produces two independent ML-KEM shared secrets.
-
-### Server contribution
-
-1. The server encapsulates to the client's ML-KEM public key, producing the server-side ML-KEM shared secret and a 1,088-byte ciphertext.
-2. The server creates a fresh ephemeral X25519 key pair and a 16-byte server salt.
-3. It sends the following signed payload:
+The client sends:
 
 ```text
-server_mlkem_ciphertext (1088 bytes)
-|| server_x25519_public_key (32 bytes)
+client_MLKEM_public_key (1,184 bytes)
+|| MLDSA_signature (3,309 bytes)
+```
+
+The signature is generated by the client's persistent ML-DSA identity key with context:
+
+```text
+CLIENT MLKEM768PublicKey
+```
+
+The server verifies the signature using the public key associated with the identity token or the key just registered.
+
+### Message 2 — Server ML-KEM public key
+
+The server sends:
+
+```text
+server_MLKEM_public_key (1,184 bytes)
+|| MLDSA_signature (3,309 bytes)
+```
+
+The signature context is:
+
+```text
+SERVER MLKEM768PublicKey
+```
+
+The client verifies it using the pinned server identity key.
+
+### Message 3 — Server handshake values
+
+The server encapsulates to the client's ML-KEM public key. This produces server-to-client KEM shared secret **A** and ciphertext **ct_A**.
+
+The server sends the following signed payload:
+
+```text
+ct_A (1,088 bytes)
+|| server_X25519_public_key (32 bytes)
 || server_salt (16 bytes)
+|| MLDSA_signature (3,309 bytes)
 ```
 
-The signature context is `SERVER HANDSHAKE VALUES`.
-
-4. The client verifies the signature, decapsulates the ML-KEM ciphertext using its ephemeral ML-KEM private key, and calculates the X25519 shared secret using its ephemeral X25519 private key and the server's public key.
-
-### Client contribution
-
-1. The client encapsulates to the server's ML-KEM public key, producing the client-side ML-KEM shared secret and a 1,088-byte ciphertext.
-2. The client creates a fresh ephemeral X25519 key pair and a 16-byte client salt.
-3. It sends the following signed payload:
+The signature context is:
 
 ```text
-client_mlkem_ciphertext (1088 bytes)
-|| client_x25519_public_key (32 bytes)
+SERVER HANDSHAKE VALUES
+```
+
+The client verifies the signature, decapsulates `ct_A` to obtain **A**, and calculates:
+
+```text
+Z = X25519(client_X25519_private_key, server_X25519_public_key)
+```
+
+### Message 4 — Client handshake values
+
+The client encapsulates to the server's ML-KEM public key. This produces client-to-server KEM shared secret **B** and ciphertext **ct_B**.
+
+The client sends:
+
+```text
+ct_B (1,088 bytes)
+|| client_X25519_public_key (32 bytes)
 || client_salt (16 bytes)
+|| MLDSA_signature (3,309 bytes)
 ```
 
-The signature context is `CLIENT HANDSHAKE VALUES`.
-
-4. The server verifies the signature, decapsulates the ML-KEM ciphertext using its ephemeral ML-KEM private key, and calculates the same X25519 shared secret using its ephemeral X25519 private key and the client's public key.
-
-## Directional traffic-key derivation
-
-Let:
-
-- `S_client` be the ML-KEM shared secret produced when the client encapsulates to the server's ML-KEM public key.
-- `S_server` be the ML-KEM shared secret produced when the server encapsulates to the client's ML-KEM public key.
-- `Z` be the X25519 shared secret.
-- `salt_client` be the client-generated 16-byte salt.
-- `salt_server` be the server-generated 16-byte salt.
-
-The client-to-server traffic key is:
+The signature context is:
 
 ```text
-K_client_to_server = HKDF-SHA3-256(
-    IKM  = S_client || Z,
-    salt = salt_client,
-    info = "CLIENT KEY",
-    L    = 32 bytes
-)
+CLIENT HANDSHAKE VALUES
 ```
 
-The server-to-client traffic key is:
+The server verifies the signature, decapsulates `ct_B` to obtain **B**, and calculates:
 
 ```text
-K_server_to_client = HKDF-SHA3-256(
-    IKM  = S_server || Z,
-    salt = salt_server,
-    info = "SERVER KEY",
-    L    = 32 bytes
-)
+Z = X25519(server_X25519_private_key, client_X25519_public_key)
 ```
 
-The client uses `K_client_to_server` for sending and `K_server_to_client` for receiving. The server uses `K_server_to_client` for sending and `K_client_to_server` for receiving.
+Both endpoints should now have the same values **A**, **B**, **Z**, `server_salt`, and `client_salt`.
 
-## Directional AAD-counter derivation
+## 6. Hybrid secret mapping
 
-Each traffic direction has a separate 64-byte initial AAD-counter value derived from that direction's traffic key.
-
-```text
-C_client_to_server = HKDF-SHA3-512(
-    IKM  = K_client_to_server,
-    salt = salt_client || salt_server,
-    info = "CLIENT AAD COUNTER",
-    L    = 64 bytes
-)
-```
-
-```text
-C_server_to_client = HKDF-SHA3-512(
-    IKM  = K_server_to_client,
-    salt = salt_server || salt_client,
-    info = "SERVER AAD COUNTER",
-    L    = 64 bytes
-)
-```
-
-The directional pairing is:
-
-| Direction | Sender's initial counter | Receiver's matching initial counter |
+| Symbol | Meaning | Established by |
 |---|---|---|
-| Client → Server | Client sending counter | Server receiving counter |
-| Server → Client | Server sending counter | Client receiving counter |
+| **A** | Server-to-client KEM shared secret | Server encapsulates to client KEM public key; client decapsulates `ct_A` |
+| **B** | Client-to-server KEM shared secret | Client encapsulates to server KEM public key; server decapsulates `ct_B` |
+| **Z** | Common X25519 shared secret | Both endpoints calculate the same ephemeral Diffie–Hellman result |
 
-For each encrypted data fragment, the current 64-byte counter value is supplied as AES-GCM additional authenticated data (AAD). The counter is interpreted as a big-endian integer and incremented for the next encrypted data fragment.
+The directional key schedule uses `B || Z` for client-to-server keys and `A || Z` for server-to-client keys. The two KEM secrets are not interchanged between directions.
 
-## Signature context strings
+## 7. Client HKDF derivations
 
-The implementation uses separate ML-DSA context strings for the signed payload types:
+All lengths below are bytes. The `info` value is the literal ASCII label shown.
 
-| Payload | Context string |
-|---|---|
-| Server-assigned client identity token | `SERVER ASSIGNED IDENTITY TOKEN` |
-| Client ML-KEM public key | `CLIENT MLKEM768PublicKey` |
-| Server ML-KEM public key | `SERVER MLKEM768PublicKey` |
-| Server handshake values | `SERVER HANDSHAKE VALUES` |
-| Client handshake values | `CLIENT HANDSHAKE VALUES` |
+| Client value | HKDF hash | Output | Salt | Info | Input key material |
+|---|---|---:|---|---|---|
+| Sending AES | SHA3-256 | 32 | `client_salt` | `CLIENT KEY` | `B || Z` |
+| Receiving AES | SHA3-256 | 32 | `server_salt` | `SERVER KEY` | `A || Z` |
+| Sending HMAC | SHA3-512 | 32 | `client_salt || server_salt` | `CLIENT HMAC KEY` | `B || Z` |
+| Receiving HMAC | SHA3-512 | 32 | `server_salt || client_salt` | `SERVER HMAC KEY` | `A || Z` |
+| Sending counter | SHA3-512 | 64 | `client_salt || server_salt` | `CLIENT AAD COUNTER` | Client sending AES key |
+| Receiving counter | SHA3-512 | 64 | `server_salt || client_salt` | `SERVER AAD COUNTER` | Client receiving AES key |
 
-The context string is part of the signature operation and must match between signing and verification.
+## 8. Server HKDF derivations
+
+The server uses the reverse sending/receiving roles.
+
+| Server value | HKDF hash | Output | Salt | Info | Input key material |
+|---|---|---:|---|---|---|
+| Sending AES | SHA3-256 | 32 | `server_salt` | `SERVER KEY` | `A || Z` |
+| Receiving AES | SHA3-256 | 32 | `client_salt` | `CLIENT KEY` | `B || Z` |
+| Sending HMAC | SHA3-512 | 32 | `server_salt || client_salt` | `SERVER HMAC KEY` | `A || Z` |
+| Receiving HMAC | SHA3-512 | 32 | `client_salt || server_salt` | `CLIENT HMAC KEY` | `B || Z` |
+| Sending counter | SHA3-512 | 64 | `server_salt || client_salt` | `SERVER AAD COUNTER` | Server sending AES key |
+| Receiving counter | SHA3-512 | 64 | `client_salt || server_salt` | `CLIENT AAD COUNTER` | Server receiving AES key |
+
+The correspondence is:
+
+| Direction | Client | Server |
+|---|---|---|
+| Client → server | Sending AES/HMAC/counter | Receiving AES/HMAC/counter |
+| Server → client | Receiving AES/HMAC/counter | Sending AES/HMAC/counter |
+
+The counters are 64-byte HKDF outputs. The record layer increments the relevant counter before authenticating or encrypting each data frame and before authenticating the stream terminator.
+
+## 9. Authentication boundaries and open design work
+
+The current signatures authenticate individual public keys and handshake-value payloads using distinct ML-DSA contexts. The current design does not include a transcript-bound Finished message or an explicit key-confirmation round trip. The full ordered handshake transcript is not incorporated into the HKDF input or a final confirmation value.
+
+The first server-key bootstrap is TOFU. Stronger initial authentication requires an independently verified fingerprint, trusted provisioning, or another authenticated identity channel. Protocol version negotiation and downgrade handling also need an explicit design before deployment.
+
+These are protocol design limitations, not claims about the strength of the underlying standardized primitives.

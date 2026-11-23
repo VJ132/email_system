@@ -1,66 +1,101 @@
-# Threat Model and Security Scope
+# Threat Model and Security Boundaries
 
-## Purpose
+## 1. Status
 
-This document describes the intended security scope of the experimental `email_system` transport design. It identifies the data being protected, the network setting, the trust model and the boundaries of the project. It is a design overview, not a formal security proof or independent audit.
+This is an experimental custom protocol built from standardized cryptographic primitives. It has not undergone formal verification or independent security review. The use of ML-KEM, X25519, ML-DSA, HKDF, AES-GCM, and HMAC does not by itself prove the security of the composed protocol.
 
-## Assets
+## 2. Assets
 
-The transport is designed to protect or manage:
+The implementation is intended to protect:
 
-- Application payload bytes while they travel between the client and server.
-- The persistent ML-DSA-65 identity private keys of the peers.
-- Per-connection ML-KEM-768 and X25519 key-establishment material.
-- Directional AES-GCM traffic keys and AAD-counter state.
-- The association between a client identity token and its ML-DSA public key.
+- The confidentiality and integrity of application payloads sent over the TCP connection.
+- The authenticity of handshake messages signed by a peer's ML-DSA identity key.
+- The separation of client-to-server and server-to-client traffic keys.
+- The integrity and expected order of frame metadata within a session.
+- The continuity of previously pinned server identity and registered client identity state.
 
-## Network setting
+Long-term ML-DSA private seeds, ephemeral KEM/X25519 private keys, derived traffic keys, identity tokens, and stored public-key associations are also security-sensitive state.
 
-The protocol operates over TCP and is intended to communicate across a network where traffic may be observed or modified by parties between the endpoints. The cryptographic design uses signed handshake values, hybrid key establishment and authenticated encryption for transport fragments.
+## 3. Adversary capabilities considered by the design
 
-## Trust model
+The intended network threat model includes an attacker who can observe, delay, inject, replay, modify, truncate, or drop TCP traffic. The cryptographic design uses signatures, key encapsulation, Diffie–Hellman, HKDF, HMAC, and AEAD to authenticate handshake payloads and protect data records against these actions within the assumptions of the primitives and implementation.
 
-### Peer identities
+The current implementation does not attempt to provide availability against an attacker who can block the network, exhaust server resources, or hold a connection open indefinitely.
 
-Each peer has a persistent ML-DSA-65 signing identity. The peer's public key is used to verify the signatures associated with identity registration and handshake values.
+## 4. Implemented mechanisms
 
-### Server first-use pinning
+### Hybrid key establishment
 
-The client stores the server's ML-DSA public key after the first-use exchange. Later connections use the stored key as the server identity key. This is a trust-on-first-use model; the initial key enrollment is the point at which the client establishes which server key it will subsequently trust.
+Two independent ML-KEM-768 shared secrets are established in opposite directions. A common ephemeral X25519 shared secret contributes to each directional derivation. This is intended to combine post-quantum and classical key-establishment contributions.
 
-### Client identity registration
+### Identity authentication
 
-The server associates a 64-byte identity token with a client's ML-DSA public key. On later connections, the token identifies the registered public key, and ML-DSA signatures provide proof of possession of the corresponding private key during the handshake.
+Persistent ML-DSA-65 keys sign the handshake's public-key and handshake-value payloads. Distinct context strings are used for the different signed message types.
 
-### Endpoint assumptions
+### Directional key separation
 
-The design assumes that the client and server endpoints, their operating systems, the Python runtime and the underlying cryptographic library are trusted. Endpoint compromise is outside the protection provided by transport encryption because an endpoint processes plaintext and holds the keys needed for its connection.
+HKDF derives separate AES-256-GCM keys, HMAC-SHA3-256 keys, and initial counters for each traffic direction. The client sending material matches the server receiving material, and vice versa.
 
-## Intended security properties
+### Record integrity
 
-The design aims to provide:
+AES-256-GCM authenticates encrypted payloads and the counter supplied as AAD. HMAC-SHA3-256 authenticates each record header together with its directional counter. The authenticated terminator consumes a counter value.
 
-- Peer authentication based on persistent ML-DSA-65 identity keys.
-- A post-quantum key-establishment contribution using ML-KEM-768.
-- A classical ephemeral key-establishment contribution using X25519.
-- Separate symmetric traffic keys for the two communication directions.
-- Confidentiality and integrity for encrypted transport fragments using AES-256-GCM.
+### Frame sequence checking
 
-These are the goals of the construction. The security of the complete protocol depends on the composition of its algorithms, message flow, state management and implementation. The use of standardized primitives alone is not a proof of protocol security.
+The receiver advances its expected counter before checking the incoming record. A record carrying an earlier or later counter does not match the HMAC expected for the next sequence value.
 
-## Security boundaries
+## 5. Trust assumptions and limitations
 
-The transport design concerns data while it is moving between connected endpoints. It does not, by itself, define:
+### First-contact server identity
 
-- Protection for messages after delivery to an endpoint.
-- Encryption of stored mail or mailbox databases.
-- End-to-end encryption between email users through intermediary mail servers.
-- Protection against a compromised client, server, operating system or cryptographic library.
-- Hiding communication metadata such as network addresses, traffic timing or message sizes.
-- Availability against denial-of-service attacks.
+The client uses Trust On First Use (TOFU) to store the server's ML-DSA public key. On a first connection, the public key is delivered over the connection being established. Without independent fingerprint verification or trusted provisioning, an active attacker present during first contact may substitute a key. TOFU provides continuity after the first pin is stored; it does not authenticate the initial key out of band.
 
-Those properties require additional application, storage, operational and protocol design.
+### Handshake transcript binding and key confirmation
 
-## Project status
+The current handshake signs individual message payloads with distinct ML-DSA context strings. It does not include a transcript-bound Finished message or an explicit key-confirmation round trip. The complete ordered handshake transcript is not bound into a final confirmation value. These are important design items for a protocol intended to resist more complex handshake manipulation and state-confusion attacks.
 
-`email_system` is an experimental engineering project. Its cryptographic design and implementation should be reviewed and tested before it is used for sensitive communication or described as a production-ready secure transport protocol. It is not presented as a replacement for TLS or as a formally verified protocol.
+### Nonce lifecycle
+
+The implementation generates a random 96-bit AES-GCM nonce for each frame. AES-GCM requires nonce uniqueness under a key, but the current code does not explicitly track nonce use or derive nonces deterministically from the record counter. The operational nonce-use bound and collision strategy need to be specified.
+
+### Counter lifecycle
+
+The counter is 64 bytes and increments as a big-endian integer. An explicit policy is needed for exhaustion and overflow. The client currently calls `write()` once per connection; if it later supports multiple calls on one stream, the advanced send counter must be retained in connection state between calls.
+
+### Key storage
+
+The helper stores persistent ML-DSA private seeds and identity data in ordinary local files. The current helper does not establish a hardened key-storage boundary, atomic update policy, access-control policy, rotation scheme, or secure-erasure procedure. Deployment requires restrictive filesystem permissions and protection of the key directory.
+
+### Resource exhaustion and connection lifecycle
+
+The record format limits the size of one frame through its 24-bit header, but the receive loops accumulate a complete logical message without a separate aggregate size bound. Explicit frame/message limits, handshake and record read deadlines, and comprehensive failure cleanup are still needed for robust network operation.
+
+### Application-level replay
+
+The record counters protect sequencing within a negotiated session. They do not define idempotency or duplicate suppression for application operations submitted again in a new session. The email/application layer needs its own message identifiers and replay/duplication policy where required.
+
+### Confidentiality and metadata
+
+Payload bytes are encrypted, but IP addresses, connection timing, traffic volume, and frame sizes remain observable. The current protocol does not attempt traffic-analysis resistance.
+
+## 6. Out of scope
+
+The current code does not provide:
+
+- A complete email application or mailbox storage model.
+- An independently authenticated first-contact server key without out-of-band provisioning.
+- A formal proof of the custom handshake or record protocol.
+- A guarantee of availability under denial-of-service conditions.
+- Application-level replay protection or message-delivery guarantees.
+- A claim of post-quantum security for the entire protocol without review of the composition, implementation, and deployment.
+
+## 7. Appropriate project description
+
+Use descriptions such as:
+
+- Experimental hybrid post-quantum/classical encrypted transport.
+- Independent cryptographic engineering project.
+- Custom transport prototype using ML-KEM-768, X25519, ML-DSA-65, HKDF, and AES-256-GCM.
+- Security properties under active investigation.
+
+Avoid claims such as *unbreakable*, *bulletproof*, *quantum-proof*, *production-secure*, *formally secure*, or *TLS replacement*.

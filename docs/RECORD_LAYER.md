@@ -1,98 +1,120 @@
-# Transport Record Layer
+# Encrypted Record Layer
 
-## Overview
+## 1. Overview
 
-The transport record layer carries application data over a TCP byte stream. Messages are divided into fragments, each encrypted with AES-256-GCM using the traffic key and directional AAD-counter state established by the handshake.
+After the handshake, each endpoint has separate directional AES-256-GCM keys, HMAC-SHA3-256 keys, and 64-byte counter state. A logical message may contain one or more data frames and ends with an authenticated stream terminator.
 
-## Encrypted fragment format
+## 2. Data-frame wire format
 
-Each encrypted fragment is encoded as:
-
-```text
-+----------------------+------------------------------+
-| Field                | Size                         |
-+----------------------+------------------------------+
-| Encrypted length     | 3 bytes                     |
-| Nonce                | 12 bytes                    |
-| Ciphertext           | Variable                    |
-| Authentication tag   | 16 bytes                    |
-+----------------------+------------------------------+
-```
-
-The length is an unsigned, big-endian, three-byte integer. It represents the ciphertext and 16-byte authentication tag together. It does not include the three-byte length field or the 12-byte nonce.
-
-The cryptographic helper constructs the encrypted fragment as:
+The exact wire order is:
 
 ```text
-nonce || AESGCM.encrypt(nonce, plaintext, aad)
++----------------------+-----------------------------+
+| Field                | Size                        |
++----------------------+-----------------------------+
+| HEADER               | 3 bytes                     |
+| HMAC                 | 32 bytes                    |
+| NONCE                | 12 bytes                    |
+| CIPHERTEXT           | Variable                    |
+| GCM TAG              | 16 bytes                    |
++----------------------+-----------------------------+
 ```
 
-The AES-GCM operation returns ciphertext followed by the 16-byte authentication tag. For a plaintext fragment of `n` bytes:
+Equivalent concatenation:
 
 ```text
-length field = n + 16
-wire size    = 3 + 12 + n + 16 bytes
+HEADER || HMAC || NONCE || CIPHERTEXT || GCM_TAG
 ```
 
-The client currently sets:
+The 3-byte header is an unsigned big-endian integer. It contains the length of the AES-GCM ciphertext **including** its 16-byte tag, but **excluding** the 12-byte nonce. The encrypted frame body read by the receiver is therefore `12 + header_length` bytes.
+
+## 3. Header authentication and sequence counter
+
+For every data frame, the sender:
+
+1. Increments its 64-byte directional counter by one, interpreted as a big-endian integer.
+2. Encrypts the plaintext using AES-256-GCM, with the incremented counter bytes as associated authenticated data (AAD).
+3. Sets the header to `len(encrypted_frame) - 12`, where `encrypted_frame` includes the nonce, ciphertext, and tag.
+4. Computes HMAC-SHA3-256 over:
+
+```text
+HEADER || COUNTER
+```
+
+5. Writes the header, 32-byte HMAC, and encrypted frame.
+
+The receiver:
+
+1. Reads the 3-byte header and 32-byte HMAC.
+2. Increments its expected directional counter.
+3. Verifies the HMAC over `HEADER || COUNTER`.
+4. If the header is nonzero, reads the 12-byte nonce plus the declared encrypted-frame length.
+5. Decrypts and authenticates using AES-256-GCM with the same counter as AAD.
+6. Appends the plaintext fragment to the current logical message.
+
+HMAC authenticates the header and sequence number before the body is read. It does **not** cover the ciphertext bytes. AES-GCM separately authenticates the nonce/ciphertext/tag and the counter supplied as AAD.
+
+## 4. AES-GCM nonce
+
+The helper `encrypt_payload()` creates a 12-byte nonce with `os.urandom(12)` for each frame. The nonce is transmitted in cleartext before the ciphertext and tag.
+
+AES-GCM requires nonce uniqueness under a given key. The current implementation uses random nonces and does not maintain an explicit per-key nonce registry or deterministic nonce allocator. The nonce lifecycle and collision-risk policy therefore remain important design considerations, especially if the number of frames per traffic key grows.
+
+## 5. Frame and message size
+
+The header is 24 bits, so the maximum value it can encode is `0xFFFFFF`.
+
+The current implementation defines:
 
 ```python
 MAX_DATA_BYTES_PER_FRAME = 0xFFFFFF - 16
 ```
 
-The maximum value of a three-byte unsigned length field is `0xFFFFFF`. With the 16-byte tag included in that length, the configured maximum plaintext fragment size is `0xFFFFFF - 16` bytes.
+The 16-byte GCM tag is included in the header length. The 12-byte nonce is excluded. Thus the configured maximum plaintext per frame is `0xFFFFFF - 16` bytes.
 
-## Message fragmentation
+`write()` fragments a larger byte string into pieces no larger than this value. The receiver concatenates the decrypted fragments until the stream terminator arrives.
 
-The sender divides an application message into fragments no larger than `MAX_DATA_BYTES_PER_FRAME`. Each fragment is encrypted separately and written to the TCP stream with its length prefix.
+The 24-bit header bounds an individual frame. The current receiver does not define a separate maximum for the total assembled logical message.
 
-A message can therefore be represented by one encrypted fragment or by multiple encrypted fragments. The receiver reads each frame, decrypts its fragment and appends the resulting plaintext to the current message buffer.
+## 6. Authenticated stream terminator
 
-## Message boundary marker
-
-After writing all encrypted fragments belonging to a message, the current framing format writes:
+The terminator is:
 
 ```text
-00 00 00
+00 00 00 || HMAC-SHA3-256(STREAM_END || COUNTER)
 ```
 
-A zero value in the three-byte length field marks the end of the current message. The receiver returns the accumulated plaintext as one message when it reads this marker.
-
-## Nonce and authentication tag
-
-The cryptographic helper creates a fresh 12-byte nonce for each encryption operation using:
+where:
 
 ```python
-nonce = os.urandom(12)
+STREAM_END = b"\x00" * 3
 ```
 
-AES-256-GCM produces the ciphertext and a 16-byte authentication tag. The nonce is transmitted with the encrypted fragment so the receiver can perform decryption and tag verification.
+The sender increments the directional counter for the terminator, computes the HMAC over the zero-length header and that counter, then writes the 3-byte header and 32-byte HMAC. There is no nonce, ciphertext, or GCM tag for a terminator.
 
-## AAD and directional counters
+The receiver increments its expected counter and verifies the HMAC before treating the zero header as the end of the logical message. The terminator consumes a counter value just like a data frame.
 
-The handshake derives a separate 64-byte initial AAD-counter value for each traffic direction. The sender supplies the current counter value as the AAD input to AES-GCM for each encrypted data fragment.
+## 7. Counter state and record ordering
 
-After an encrypted data fragment is processed, the counter is interpreted as a big-endian integer, incremented, and encoded again as 64 bytes:
+Counters are independent for client-to-server and server-to-client traffic. The initial 64-byte values are derived by HKDF from the corresponding directional AES key and direction-specific salt ordering.
 
-```python
-counter = (int.from_bytes(counter, "big") + 1).to_bytes(64, "big")
-```
+Each sender and receiver increments its own counter before processing a record. Since the counter is included in the HMAC input and is also used as GCM AAD, the receiver expects the next record in that direction. Old, duplicated, or skipped sequence values do not authenticate against the receiver's expected counter.
 
-The client-to-server and server-to-client directions maintain independent counter state. The sender's initial counter is derived to match the receiver's initial counter for the same direction. See [CRYPTOGRAPHIC_HANDSHAKE.md](CRYPTOGRAPHIC_HANDSHAKE.md#directional-aad-counter-derivation) for the derivation parameters.
+The current client `write()` function updates a local counter variable but does not return it. The client entry point currently invokes `write()` once per connection. Repeated independent calls to `write()` on the same connection need a persistent per-connection send-counter owner or a revised function interface that returns and retains the updated counter. Within a single `write()` call, the counter advances across all fragments and the terminator.
 
-The AAD counter and the AES-GCM nonce are separate values with separate roles: the counter is passed as AAD, while the 12-byte nonce is passed as the GCM nonce.
+The server keeps its sending and receiving counter variables in the connection handler's scope, so they persist across its message loop. Counter exhaustion/overflow needs an explicit policy before long-lived or production use.
 
-## TCP stream handling
+## 8. Current receive-loop behavior
 
-TCP provides an ordered byte stream rather than application messages. The implementation uses `asyncio.StreamReader.readexactly()` to read the three-byte length field and then the number of bytes indicated by that field. This reconstructs complete frames even when the underlying TCP data arrives in multiple network packets or stream reads.
+Both client and server receive loops:
 
-## Record-layer responsibilities
+- Read a logical message as a sequence of authenticated frames.
+- Accumulate plaintext fragments until an authenticated terminator.
+- Report the frame count and assembled payload length.
+- Continue waiting for the next logical message on the stream.
 
-The record layer is responsible for:
+The current server then sends a fixed test response. Application-level message dispatch and delivery are not implemented in this record layer.
 
-- Encoding and decoding the frame length.
-- Fragmenting outgoing application messages.
-- Reassembling incoming fragments into messages.
-- Supplying the appropriate directional traffic key and AAD-counter value to AES-GCM.
-- Carrying the nonce, ciphertext and authentication tag between peers.
-- Preserving independent state for each connection and traffic direction.
+## 9. TCP and record-layer responsibilities
+
+TCP provides an ordered byte stream and handles network packet retransmission. The record layer independently authenticates record metadata and checks the expected directional sequence state. The counter mechanism is not an application-level duplicate-request control: an application message deliberately submitted again inside a new valid session is a separate application-layer event.

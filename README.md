@@ -1,89 +1,72 @@
 # email_system
 
-An experimental email-system project built around a hybrid post-quantum transport design. The transport prototype combines ML-KEM-768, X25519, ML-DSA-65, HKDF-SHA3 and AES-256-GCM.
+An independently developed experimental email-system project with a custom hybrid post-quantum/classical encrypted transport prototype.
 
-> **Project status:** Experimental and under active development. The protocol is a research and engineering project and has not undergone independent security review. It should not be treated as a production-ready replacement for established secure transport protocols.
+> **Status:** Experimental. The implementation is intended for cryptographic engineering and protocol experimentation. It has not been formally verified or independently security-audited and should not be used as a production secure transport or as a replacement for TLS.
 
-## Overview
+## Current scope
 
-The project explores a transport layer for an email system. Its current design establishes peer identities, combines post-quantum and classical key-establishment contributions, derives independent traffic keys for each direction, and encrypts framed application data over TCP.
+The current source demonstrates an asynchronous TCP connection, peer identity handling, a hybrid key-establishment handshake, directional key derivation, and bidirectional encrypted record exchange. The supplied client sends a fragmented test payload. The server receives it and sends a separate fragmented test response. The receive loops assemble messages and report their frame count and payload length.
 
-The email application is the broader project goal. Mailbox management, message storage, submission, delivery, retrieval and a user-facing client belong to the application layer built above the transport.
+This is not yet a complete email application. Mailboxes, account management, message storage, message submission/delivery, retrieval, and a user-facing mail client are application-layer work that sits above the transport.
 
 ## Cryptographic components
 
 | Component | Role |
 |---|---|
-| ML-KEM-768 | Post-quantum key encapsulation; each peer contributes a shared secret |
-| X25519 | Ephemeral classical Diffie–Hellman contribution |
-| ML-DSA-65 | Long-term signing identity and authentication of exchanged handshake values |
-| HKDF-SHA3-256 | Derives the directional 32-byte AES-GCM traffic keys |
-| HKDF-SHA3-512 | Derives the directional 64-byte initial AAD-counter values |
-| AES-256-GCM | Encrypts and authenticates transport fragments |
+| ML-KEM-768 | Post-quantum key encapsulation; one independent shared secret is established in each direction |
+| X25519 | Ephemeral classical Diffie–Hellman contribution shared by both directions |
+| ML-DSA-65 | Persistent signing identity used to authenticate handshake messages |
+| HKDF-SHA3-256 | Derives directional 32-byte AES-GCM traffic keys |
+| HKDF-SHA3-512 | Derives directional HMAC keys and 64-byte initial counters |
+| AES-256-GCM | Encrypts and authenticates each data-frame payload |
+| HMAC-SHA3-256 | Authenticates the frame header together with its sequence counter |
 
-The protocol uses separate keys and counter state for client-to-server and server-to-client traffic.
+The client-to-server and server-to-client paths use separate AES keys, HMAC keys, and counters. The directional key schedule is described in [CRYPTOGRAPHIC_HANDSHAKE.md](docs/CRYPTOGRAPHIC_HANDSHAKE.md).
 
-## High-level connection flow
+## Connection flow
 
-1. The client obtains or reuses the server's ML-DSA-65 public identity key. The first-use flow pins the key for later connections.
-2. The client presents its registered identity token or registers its ML-DSA-65 public key.
-3. The peers exchange ML-KEM-768 public keys authenticated with their ML-DSA identities.
-4. Each peer encapsulates to the other peer's ML-KEM public key. Each also contributes an ephemeral X25519 public key and a fresh 16-byte salt.
-5. The peers verify the signed handshake values, decapsulate the ML-KEM ciphertexts, calculate the X25519 shared secret and derive directional traffic material with HKDF.
-6. Application data is divided into transport fragments and protected with AES-256-GCM.
+1. The client loads or bootstraps the server's ML-DSA-65 public key using Trust On First Use (TOFU).
+2. The client authenticates with its existing identity token or registers its ML-DSA-65 public key.
+3. The client and server exchange ML-KEM-768 public keys, each signed by the sender's ML-DSA identity.
+4. The server encapsulates to the client's ML-KEM public key and sends the ciphertext, its ephemeral X25519 public key, a 16-byte salt, and an ML-DSA signature.
+5. The client decapsulates the ciphertext, computes the X25519 shared secret, then encapsulates to the server's ML-KEM public key and sends its corresponding signed values.
+6. The server decapsulates the client ciphertext and computes the same X25519 shared secret.
+7. Both endpoints derive matching directional AES keys, HMAC keys, and initial counters with HKDF.
+8. Data is fragmented into frames protected by AES-256-GCM, with HMAC authentication for each frame header and counter.
 
-See [docs/CRYPTOGRAPHIC_HANDSHAKE.md](docs/CRYPTOGRAPHIC_HANDSHAKE.md) for the message flow and derivation details.
+See [CRYPTOGRAPHIC_HANDSHAKE.md](docs/CRYPTOGRAPHIC_HANDSHAKE.md) and [RECORD_LAYER.md](docs/RECORD_LAYER.md) for the protocol details.
 
-## Transport framing
+## Protocol diagram
 
-Each encrypted fragment is carried in this format:
-
-```text
-+----------------------+------------------------------+
-| Field                | Size                         |
-+----------------------+------------------------------+
-| Encrypted length     | 3 bytes                     |
-| Nonce                | 12 bytes                    |
-| Ciphertext           | Variable                    |
-| Authentication tag   | 16 bytes                    |
-+----------------------+------------------------------+
-```
-
-The three-byte unsigned big-endian length is the ciphertext length plus the 16-byte authentication tag. It does not include the nonce. A three-byte zero length is used as the current message-end marker.
-
-The maximum plaintext fragment size selected by the current client is `0xFFFFFF - 16` bytes. The record-layer description is in [docs/RECORD_LAYER.md](docs/RECORD_LAYER.md).
+The editable architecture and protocol-flow diagram is [email_system_protocol.excalidraw](diagrams/email_system_protocol.excalidraw). Open it at [Excalidraw](https://excalidraw.com) using **Open** or **Load**.
 
 ## Repository documentation
 
-- [Architecture](docs/ARCHITECTURE.md) — system components, connection flow and responsibilities.
-- [Cryptographic handshake](docs/CRYPTOGRAPHIC_HANDSHAKE.md) — identity handling, signed messages and HKDF derivations.
-- [Record layer](docs/RECORD_LAYER.md) — frame layout, fragmentation, nonces and directional counters.
-- [Threat model](docs/THREAT_MODEL.md) — project scope, security goals, assumptions and trust boundaries.
+- [Architecture](docs/ARCHITECTURE.md) — endpoints, identity state, connection lifecycle, and present application scope.
+- [Cryptographic handshake](docs/CRYPTOGRAPHIC_HANDSHAKE.md) — identity registration, signed handshake payloads, KEM roles, X25519, and exact HKDF derivations.
+- [Record layer](docs/RECORD_LAYER.md) — wire format, counters, HMAC, AES-GCM, fragmentation, and terminators.
+- [Threat model](docs/THREAT_MODEL.md) — assets, assumptions, trust boundaries, protections, and limitations.
+- [Implementation status](docs/IMPLEMENTATION_STATUS.md) — source-visible behavior and remaining engineering work.
 
 ## Development environment
 
-The current implementation is written in Python and uses:
+The code is Python and uses `asyncio` TCP streams and the `cryptography` package. The installed `cryptography` release must expose the ML-KEM and ML-DSA APIs imported by `src/crypto/helpers.py`:
 
-- Python 3.10 or later.
-- `asyncio` TCP streams.
-- The `cryptography` package with the ML-KEM and ML-DSA APIs used by the source.
+```python
+from cryptography.hazmat.primitives.asymmetric import mlkem, mldsa, x25519
+```
 
-Install the cryptography dependency with:
+Install or upgrade the dependency in a virtual environment:
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 python -m pip install --upgrade cryptography
 ```
 
-The source currently keeps key-directory paths in the client and server scripts. Configure those paths for the local environment before running either endpoint. Start the server before connecting with the client.
-
-## Development direction
-
-- Specify the handshake and record formats precisely.
-- Build automated tests for key agreement, identity authentication and encrypted transport.
-- Add the email application layer: accounts, mailboxes, message submission, delivery and retrieval.
-- Add persistent message storage and a user-facing client.
-- Document deployment and operational configuration.
+The endpoint scripts currently derive their key-directory paths relative to their own source files. Ensure the expected `keys/` directory structure exists and is writable before running the endpoints. The server listens on `localhost:6969` using IPv6; start it before launching the client.
 
 ## Security note
 
-The project is experimental. The use of standardized cryptographic primitives does not by itself establish the security of a protocol built from them. Review the complete protocol design and implementation before relying on it for sensitive communication.
+The use of standardized cryptographic primitives does not by itself establish the security of a protocol composed from them. The handshake, identity bootstrap, key schedule, record state machine, nonce lifecycle, and operational key storage all require careful review. Do not use this prototype to protect real email or other sensitive traffic.
