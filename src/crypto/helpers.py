@@ -1,7 +1,6 @@
 from cryptography.hazmat.primitives.asymmetric import mlkem, mldsa, x25519
 from cryptography.hazmat.primitives.ciphers import aead
 import cryptography.exceptions as crypto_exceptions
-from cryptography.hazmat.primitives.kdf import hkdf
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import hmac
 import os
